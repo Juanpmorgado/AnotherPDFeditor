@@ -1,0 +1,257 @@
+import { useRef, useEffect, useState } from 'react';
+import { usePDFState } from '../hooks/usePDFState';
+import { useHistory } from '../hooks/useHistory';
+import { renderPage, extractTextWithPositions } from '../lib/pdfLoader';
+import { loadPDFForEditing, updatePDFText } from '../lib/pdfEditor';
+import { clearCanvas, getCanvasCoordinates, isPointInRect, highlightArea } from '../lib/canvasRenderer';
+import { getStandardFont } from '../utils/fontLibrary';
+
+export default function PDFViewer() {
+  const canvasRef = useRef(null);
+  const overlayRef = useRef(null);
+  const textLayerRef = useRef(null);
+
+  const {
+    pdf,
+    currentPage,
+    scale,
+    textItems,
+    setTextItems,
+    selectedTextId,
+    selectText,
+    pdfBytes,
+    setPDFBytes
+  } = usePDFState();
+
+  const { push: saveHistory } = useHistory();
+  const [hoveredTextId, setHoveredTextId] = useState(null);
+
+  // Render PDF page
+  useEffect(() => {
+    if (!pdf || !canvasRef.current) return;
+
+    const renderCurrentPage = async () => {
+      try {
+        const page = await pdf.getPage(currentPage);
+        await renderPage(page, canvasRef.current, scale);
+
+        // Extract text positions
+        const texts = await extractTextWithPositions(page);
+        const viewport = page.getViewport({ scale });
+
+        const textItemsWithIds = texts.map((text, index) => ({
+          ...text,
+          id: `text-${currentPage}-${index}`,
+          pageNum: currentPage,
+          pageY: text.y,
+          y: viewport.height - text.y, // Convert to canvas coordinates
+          modified: false,
+        }));
+
+        setTextItems(textItemsWithIds);
+      } catch (error) {
+        console.error('Error rendering page:', error);
+      }
+    };
+
+    renderCurrentPage();
+  }, [pdf, currentPage, scale, setTextItems]);
+
+  // Draw text overlay for modified text
+  useEffect(() => {
+    if (!textLayerRef.current || !canvasRef.current) return;
+
+    const textLayer = textLayerRef.current;
+    const canvas = canvasRef.current;
+
+    textLayer.width = canvas.width;
+    textLayer.height = canvas.height;
+
+    const ctx = textLayer.getContext('2d');
+    clearCanvas(textLayer);
+
+    // Draw modified text on overlay
+    textItems
+      .filter((item) => item.modified)
+      .forEach((item) => {
+        // Cover old text with white rectangle
+        ctx.fillStyle = 'white';
+        ctx.fillRect(item.x - 2, item.y - item.height - 2, item.width + 4, item.height + 4);
+
+        // Draw new text
+        ctx.font = `${item.fontSize}px ${item.fontName || 'Arial'}`;
+        ctx.fillStyle = '#000000';
+        ctx.fillText(item.text, item.x, item.y);
+      });
+  }, [textItems]);
+
+  // Handle canvas clicks
+  const handleCanvasClick = (e) => {
+    if (!canvasRef.current) return;
+
+    const coords = getCanvasCoordinates(canvasRef.current, e);
+
+    // Check if click is on a text item
+    const clickedText = textItems.find((item) =>
+      isPointInRect(coords, {
+        x: item.x,
+        y: item.y - item.height,
+        width: item.width,
+        height: item.height,
+      })
+    );
+
+    if (clickedText) {
+      selectText(clickedText.id);
+    } else {
+      selectText(null);
+    }
+  };
+
+  // Handle mouse move for hover effects
+  const handleMouseMove = (e) => {
+    if (!canvasRef.current) return;
+
+    const coords = getCanvasCoordinates(canvasRef.current, e);
+
+    const hoveredText = textItems.find((item) =>
+      isPointInRect(coords, {
+        x: item.x,
+        y: item.y - item.height,
+        width: item.width,
+        height: item.height,
+      })
+    );
+
+    setHoveredTextId(hoveredText ? hoveredText.id : null);
+  };
+
+  // Draw overlay for selections and hovers
+  useEffect(() => {
+    if (!overlayRef.current || !canvasRef.current) return;
+
+    const overlay = overlayRef.current;
+    const canvas = canvasRef.current;
+
+    overlay.width = canvas.width;
+    overlay.height = canvas.height;
+
+    const ctx = overlay.getContext('2d');
+    clearCanvas(overlay);
+
+    // Highlight hovered text
+    if (hoveredTextId) {
+      const item = textItems.find((t) => t.id === hoveredTextId);
+      if (item) {
+        highlightArea(ctx, {
+          x: item.x,
+          y: item.y - item.height,
+          width: item.width,
+          height: item.height,
+        }, 'rgba(59, 130, 246, 0.15)');
+      }
+    }
+
+    // Highlight selected text
+    if (selectedTextId) {
+      const item = textItems.find((t) => t.id === selectedTextId);
+      if (item) {
+        highlightArea(ctx, {
+          x: item.x,
+          y: item.y - item.height,
+          width: item.width,
+          height: item.height,
+        }, 'rgba(59, 130, 246, 0.3)');
+
+        // Draw border around selected text
+        ctx.strokeStyle = '#3B82F6';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(
+          item.x - 2,
+          item.y - item.height - 2,
+          item.width + 4,
+          item.height + 4
+        );
+      }
+    }
+  }, [hoveredTextId, selectedTextId, textItems]);
+
+  // Apply edits to actual PDF when text is modified
+  useEffect(() => {
+    const applyEditsToPDF = async () => {
+      const modifiedItems = textItems.filter(item => item.modified);
+      if (modifiedItems.length === 0 || !pdfBytes) return;
+
+      try {
+        // Load PDF for editing
+        const pdfDoc = await loadPDFForEditing(pdfBytes);
+
+        // Group edits by page
+        const editsByPage = {};
+        modifiedItems.forEach(item => {
+          if (!editsByPage[item.pageNum]) {
+            editsByPage[item.pageNum] = [];
+          }
+          editsByPage[item.pageNum].push({
+            text: item.text,
+            x: item.x,
+            y: item.pageY,
+            width: item.width,
+            height: item.height,
+            fontSize: item.fontSize,
+            fontType: getStandardFont(item.fontName),
+            coverOld: true,
+          });
+        });
+
+        // Apply edits for each page
+        for (const [pageNum, edits] of Object.entries(editsByPage)) {
+          await updatePDFText(pdfDoc, parseInt(pageNum) - 1, edits);
+        }
+
+        // Save updated PDF
+        const updatedBytes = await pdfDoc.save();
+        setPDFBytes(updatedBytes);
+
+        // Save to history
+        saveHistory({ textItems, timestamp: Date.now() });
+      } catch (error) {
+        console.error('Failed to apply edits to PDF:', error);
+      }
+    };
+
+    // Debounce PDF updates
+    const timer = setTimeout(applyEditsToPDF, 1000);
+    return () => clearTimeout(timer);
+  }, [textItems, pdfBytes, setPDFBytes, saveHistory]);
+
+  if (!pdf) {
+    return null;
+  }
+
+  return (
+    <div className="relative flex items-center justify-center bg-gray-100 p-4 overflow-auto h-full">
+      <div className="relative shadow-2xl">
+        {/* Base PDF canvas */}
+        <canvas
+          ref={canvasRef}
+          className="border border-gray-300 bg-white"
+        />
+
+        {/* Text edit overlay */}
+        <canvas
+          ref={textLayerRef}
+          className="absolute top-0 left-0 pointer-events-none"
+        />
+
+        {/* Selection/hover overlay */}
+        <canvas
+          ref={overlayRef}
+          className="absolute top-0 left-0 cursor-pointer"
+          onClick={handleCanvasClick}
+          onMouseMove={handleMouseMove}
+        />
+      </div>
+    </div>
+  );
+}
